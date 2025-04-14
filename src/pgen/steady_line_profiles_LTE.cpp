@@ -100,7 +100,11 @@ Real calc_alpha(Real n, Real T, Real nuD, Real nu)
   Real n_1 = A_abun*eta_ion*n; // level population of lower level
 
   // evaluate correction factor for stimulated emission
-  Real dnu = nu - nuD;
+  
+  Real dnulab = nu - nuD; // This is delta nu in the lab frame 
+  Real dnu = (nu0/nuD)*dnulab; // This is delta nu in the comoving farme
+
+
   Real fac = 1. - exp(-h_over_kb*(nu0 + dnu)/T);
   // Real fac = 1. - exp(-h_over_kb*nu/T);
   // Real fac = 1. - exp(-h_over_kb*nuD/T);
@@ -117,7 +121,10 @@ Real calc_alpha(Real n, Real T, Real nuD, Real nu)
 
 Real calc_Bnu(Real T, Real nuD, Real nu)
 {
-  Real dnu = nu - nuD;
+  Real dnulab = nu - nuD;  // This is the delta nu in the lab frame
+  
+  Real dnu = (nu0/nuD)*dnulab; // This is delta nu in the comoving farme
+
   Real nu_cmv = nu0 + dnu;
   
   return 2.*h_over_c2*pow(nu_cmv,3.)/(exp(h_over_kb*nu_cmv/T) - 1.0);
@@ -574,6 +581,7 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
   Real v_r = phydro->u(IM1,k,j,i)/phydro->u(IDN,k,j,i);
   Real v_t = phydro->u(IM2,k,j,i)/phydro->u(IDN,k,j,i);
   Real v_p = phydro->u(IM3,k,j,i)/phydro->u(IDN,k,j,i);
+  Real v_2 = v_r*v_r + v_t*v_t + v_p*v_p;
   Real v_los = v_r*proj.n_r + v_t*proj.n_t + v_p*proj.n_p;
 
   // Running Tally of Tau in the wing, if the wing tau is >10 then the entire band is thick and the escape probability -> 0 (skip remaining line of sight)
@@ -650,11 +658,18 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
   Real T_lm1 = T_cgs;
   // Real kappa_lm1 = calc_opacity(xi_l,T_l);
   Real v_lm1 = v_l;
-  //Real LF = 1/sqrt(1 -(v_r*v_r + v_t*v_t + v_p*v_p));
-  //Real nuD_lm1 = nu0/(LF*(1.-v_los));  // lab frame n, use equation 89.5
+
+
+  // Doppler
+
+  Real LF = 1/sqrt(1 -(v_2));
+  
+  //Real nuD_lm1 = nu0/((1.-v_los));  // lab frame n, use equation 89.5
+    //cout <<  "Relativistic" << nuD_lm1 << endl;
   Real nuD_lm1 = nu0*(1.+v_los);
-
-
+  nuD_lm1 = nu0/(LF*(1.-v_los));  // lab frame n, use equation 89.5
+  //cout <<  "Difference" << (nuD_lm1 - nuD_lm12)/(nu0*y_th) << endl;
+    
 
   // if (k==ks && j==js)
   //   cout << "\nr = " << r << endl;
@@ -683,9 +698,10 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
     v_l = v_x*sin_i + v_z*cos_i;
 
     // Doppler shifted line center freq
-    //Real nuD_l = nu0/(LF*(1.-v_los));  // Lab frame n , we use equation 89.5
+    //Real nuD_l = nu0/((1.-v_los));  // Lab frame n , we use equation 89.5
     Real nuD_l = nu0*(1.+v_l);
-
+    nuD_l = nu0/(LF*(1.-v_los));  // Lab frame n , we use equation 89.5
+    
     // calculate the Sobolev length (for comparison purposes)
     Real Q,l_sob;
     if (il == 1) {
@@ -727,7 +743,7 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
           Real nu = nu1 + inu*dnu;
           Real alpha_lm1 = calc_alpha(n_lm1,T_lm1,nuD_lm1,nu);
           Real alpha_l = calc_alpha(n_l,T_l,nuD_l,nu);
-          Real delta_tau = (length_unit*dl)*0.5*(alpha_lm1 + alpha_l); // JAK added length unit to match alpha units correctly // Added relativisitic factor (nu/nu0) see notes
+          Real delta_tau = (length_unit*dl)*0.5*(alpha_lm1 + alpha_l)*((nu0)/(0.5*(nuD_lm1+nuD_l))); // JAK added length unit to match alpha units correctly // Added relativisitic factor (nu/nu0) see notes
           
 
 
@@ -769,7 +785,7 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
                   }}
                   
             tauW = 0;
-            cout <<  "Terminate  i = " << i << ", j = " << j << ", k = " << k << endl;
+            //cout <<  "Terminate  i = " << i << ", j = " << j << ", k = " << k << endl;
           }
             
           
@@ -796,8 +812,11 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
   pmb->pmy_mesh->ruser_mesh_data[8](1) += 1;
   //pmb->pmy_mesh->ruser_mesh_data[10](1) += calc_jnu(n_cgs,T_cgs,nuD,nuD)*;
   
+
+  // Doppler
   Real nuD = nu0*(1.+v_los);
-  // Real nuD = nu0/(LF*(1.-v_los));   /// Going from lab frame to comoving frame, see page 412 eq 89.5 Rad Hydro Mihalas , v_los = labframe n dot v
+  nuD = nu0/(LF*(1.-v_los));   // Going from lab frame to comoving frame, see page 412 eq 89.5 Rad Hydro Mihalas , v_los = labframe n dot v
+  //Real nuD = nu0/((1.-v_los));   // Going from lab frame to comoving frame, see page 412 eq 89.5 Rad Hydro Mihalas , v_los = labframe n dot v
   Real nu_sum = 0.;
   Real jnu_avg = 0.;
   Real jeff_avg = 0.;
@@ -833,8 +852,8 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
       Real p_nu = pnu_local*pnu_nonlocal;
       // std::cout << "p_nu = " << p_nu << std::endl;// added JAK
       // add to luminosity
-      pmb->pmy_mesh->ruser_mesh_data[2](idx,inu) += j_nu*p_nu*dV;
-      pmb->pmy_mesh->ruser_mesh_data[3](idx,inu) += j_nu*dV;
+      pmb->pmy_mesh->ruser_mesh_data[2](idx,inu) += ((nuD/nu0)*(nuD/nu0))*j_nu*p_nu*dV;
+      pmb->pmy_mesh->ruser_mesh_data[3](idx,inu) += ((nuD/nu0)*(nuD/nu0))*j_nu*dV;
       pmb->pmy_mesh->ruser_mesh_data[6](idx,inu) += dV;
       pmb->pmy_mesh->ruser_mesh_data[9](idx,inu) += 1;
       
