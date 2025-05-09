@@ -46,7 +46,7 @@ Real p_units,length_unit;
 Real y_min, y_max, bin_size, dnu;
 Real theta_min,theta_max;
 Real Inc;
-bool use_nuD;
+bool use_nuD, SR, argb;
 
 gsl_histogram* L0bins = gsl_histogram_alloc(1);
 using namespace std;
@@ -57,6 +57,7 @@ int write_Nbins_dump(string filename, Mesh*, int n=1);
 int write_TotV_dump(string filename, Mesh*, int n=1);
 int write_bins(string filename);
 int write_Pnu_dump(string fname, MeshBlock *pmb, int n, int ie, int je, int ke, int is, int js, int ks);
+int write_nu_cmv_dump(string fname, MeshBlock *pmb, int n, int ie, int je, int ke, int is, int js, int ks, int Nbins, int Nnu_per_bin);
 string default_filename(string label);
 
 template <class T>
@@ -94,41 +95,105 @@ Real calc_opacity(Real xi, Real T) {
   return 1.;
 }
 
-Real calc_alpha(Real n, Real T, Real nuD, Real nu)
+
+
+Real calc_Doppler_Shift(Real v, Real v_los, bool SR)
 {
+  Real LF = 1/sqrt(1 -(v*v));
+  Real Dop_Shift;
+    
+  if (SR == 1)
+    {Dop_Shift =  1.0/(LF*(1.-v_los));} // lab frame n, use equation 89.5 from Mihalas Mihalas
+
+  else
+    {Dop_Shift = (1.0 + v_los);}    
+
+  return Dop_Shift;
+}
+
+
+
+
+Real calc_cmv_nu(Real nuD, Real nu)
+{
+  // Real dnu = nu - nuD;
+  // Real nu_cmv = nu0 + dnu;
+  Real nu_cmv = (nu/nuD)*nu0;
+
+  return nu_cmv;
+}
+
+Real calc_arg(Real nu_cmv, bool argb, Real nu, Real nuD)
+{
+  Real arg;
+  if (argb)
+  {
+    arg = (nu - nuD)/delta_nu0;
+  }
+  else 
+  {
+    arg = (nu_cmv - nu0)/delta_nu0;
+  }
+
+
+  return arg;
+}
+
+Real calc_alpha(Real n, Real T, Real nuD, Real nu, bool SR, bool argb)
+{
+
+  Real nu_cmv = calc_cmv_nu(nuD, nu);
+
+
   Real eta_ion = 1.0; // this needs to be passed in later
   Real n_1 = A_abun*eta_ion*n; // level population of lower level
 
   // evaluate correction factor for stimulated emission
-  Real dnu = nu - nuD;
-  Real fac = 1. - exp(-h_over_kb*(nu0 + dnu)/T);
+  Real fac = 1. - exp(-h_over_kb*(nu_cmv)/T);
   // Real fac = 1. - exp(-h_over_kb*nu/T);
   // Real fac = 1. - exp(-h_over_kb*nuD/T);
   // Real fac = 1.;
 
   // profile function
-  Real arg = (nu - nuD)/delta_nu0;
+  Real arg = calc_arg(nu_cmv, argb, nu, nuD);
   Real phi_nu = phi_norm*exp(-arg*arg);
 
-  return n_1*a12_*fac*phi_nu;
-  //return 5*exp(-arg*arg);
+  
+
+    if (SR)
+  {
+    return (nu_cmv/nu)*n_1*a12_*fac*phi_nu;  // added relativistic correction to extinction
+  }
+  else 
+  {
+    return n_1*a12_*fac*phi_nu;
+  }
   
 }
 
-Real calc_Bnu(Real T, Real nuD, Real nu)
+Real calc_Bnu(Real T, Real nuD, Real nu, bool SR)
 {
-  Real dnu = nu - nuD;
-  Real nu_cmv = nu0 + dnu;
+  Real nu_cmv = calc_cmv_nu(nuD, nu);
+
+  if (SR)
+  {
+    return (nu/nu_cmv)*(nu/nu_cmv)*(nu/nu_cmv)*2.*h_over_c2*pow(nu_cmv,3.)/(exp(h_over_kb*nu_cmv/T) - 1.0); // added relativistic correction to source function
+  }
+  else 
+  {
+    return 2.*h_over_c2*pow(nu_cmv,3.)/(exp(h_over_kb*nu_cmv/T) - 1.0); 
+  }
   
-  return 2.*h_over_c2*pow(nu_cmv,3.)/(exp(h_over_kb*nu_cmv/T) - 1.0);
-  //return 1;
 }
 
-Real calc_jnu(Real n, Real T, Real nuD, Real nu)
+Real calc_jnu(Real n, Real T, Real nuD, Real nu, bool SR)
 {
-  Real alpha_nu = calc_alpha(n,T,nuD,nu);
+
+  Real nu_cmv = calc_cmv_nu(nuD, nu);
+  Real alpha_nu = calc_alpha(n,T,nuD,nu,SR,argb);
   
-  return alpha_nu*calc_Bnu(T,nuD,nu);
+
+  return alpha_nu*calc_Bnu(T,nuD,nu,SR); 
 }
 
 class Projections {
@@ -226,6 +291,9 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   theta_min = pin->GetOrAddReal("problem","theta_min",0.);    // ignore zones with theta < theta_min
   theta_max = pin->GetOrAddReal("problem","theta_max",180.);  // ignore zones with theta > theta_max
   use_nuD = pin->GetOrAddBoolean("problem","use_nuD",false);  // set every freq. in the Gaussian to nuD
+  SR = pin->GetOrAddBoolean("problem","SR",false);  // Use inertial effects of special relativity if true.  Default use non relativistic 
+  argb = pin->GetOrAddBoolean("problem","argb",false);  // Use inertial effects of special relativity if true.  Default use non relativistic 
+
 
   // parameters set by the choice of ion/transition (default values are for Hbeta)
   Real atomic_number = pin->GetOrAddReal("problem","atomic_number",1.);  // number of protons + neutrons
@@ -264,7 +332,16 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   
   // initialize freq grid
   L0bins = gsl_histogram_alloc(Nbins); // reallocate histogram
-  gsl_histogram_set_ranges_uniform (L0bins, y_min, y_max);
+  
+  if (SR)
+    {
+    gsl_histogram_set_ranges_uniform (L0bins, (sqrt((1+y_min)/(1-y_min))-1), (sqrt((1+y_max)/(1-y_max))-1));
+    } 
+  else
+    {
+      gsl_histogram_set_ranges_uniform (L0bins, y_min, y_max);
+    }
+
   bin_size = fabs(L0bins->range[1] - L0bins->range[0]);  // Gets absolute value of the size of the first bin
   dnu = nu0*bin_size/(Real)Nnu_per_bin;
   for (int ii=0; ii<Nbins; ii++) 
@@ -279,8 +356,8 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   cout << "Correction for stimulated emission = " << 1. - exp(-h_over_kb*nu0/T_gas) << endl;
   cout << "a12 = " << a12_ << endl;
   cout << "delta_nu0 = " << delta_nu0 << endl;
-  cout << "Bnu0 = " << calc_Bnu(T_gas,nu0,nu0) << endl;
-  cout << "alphanu = " << calc_alpha(n_gas,T_gas,nu0,nu0) << endl;
+  cout << "Bnu0 = " << calc_Bnu(T_gas,nu0,nu0,SR) << endl;
+  cout << "alphanu = " << calc_alpha(n_gas,T_gas,nu0,nu0,SR,argb) << endl;
   cout << "phi_nu0 = " << phi_norm << endl; 
 
   // Shu test
@@ -329,6 +406,15 @@ void MeshBlock::InitUserMeshBlockData(ParameterInput *pin)
   ruser_meshblock_data[4].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST);
   ruser_meshblock_data[5].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST);
   ruser_meshblock_data[6].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST);
+  // ruser_meshblock_data[7].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[8].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[9].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[10].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[11].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[12].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[13].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[14].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
+  // ruser_meshblock_data[15].NewAthenaArray((ke-ks)+2*NGHOST,(je-js)+2*NGHOST,(ie-is)+2*NGHOST, Nbins, Nnu_per_bin);
 
   return;
 
@@ -477,16 +563,16 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
   if (write_NbinsxNnu_dump(dump_string, this->pmy_mesh, 3) == 0){
     cout << "[ProblemGenerator]: Dump " << dump_string << " is the non-averaged line profile (with p_nu=1) computed at t=0." << endl;}
 
-  // write the (p_nu=1) steady line profile computed before averaging over frequency
-  dump_string = default_filename("Bin Volume");
-  if (write_NbinsxNnu_dump(dump_string, this->pmy_mesh, 6) == 0){
-    cout << "[ProblemGenerator]: Dump " << dump_string << " is the non-averaged volume computed at t=0." << endl;}
+  // // write the (p_nu=1) steady line profile computed before averaging over frequency
+  // dump_string = default_filename("Bin Volume");
+  // if (write_NbinsxNnu_dump(dump_string, this->pmy_mesh, 6) == 0){
+  //   cout << "[ProblemGenerator]: Dump " << dump_string << " is the non-averaged volume computed at t=0." << endl;}
 
 
-  // write the (p_nu=1) steady line profile computed before averaging over frequency
-  dump_string = default_filename("Bin Count");
-  if (write_NbinsxNnu_dump(dump_string, this->pmy_mesh, 9) == 0){
-    cout << "[ProblemGenerator]: Dump " << dump_string << " is the number of volume entries in to NbinxNu computed at t=0." << endl;}
+  // // write the (p_nu=1) steady line profile computed before averaging over frequency
+  // dump_string = default_filename("Bin Count");
+  // if (write_NbinsxNnu_dump(dump_string, this->pmy_mesh, 9) == 0){
+  //   cout << "[ProblemGenerator]: Dump " << dump_string << " is the number of volume entries in to NbinxNu computed at t=0." << endl;}
     
   
 
@@ -500,16 +586,91 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
   if (write_Nbins_dump(dump_string, this->pmy_mesh, 5) == 0){
     cout << "[ProblemGenerator]: Dump " << dump_string << " is the averaged line profile (with p_nu=1) computed at t=0." << endl;}
  
-  // write the (p_nu=1) steady line profile averaged over frequency
-  dump_string = default_filename("Total Volume");
-  if (write_TotV_dump(dump_string, this->pmy_mesh, 7) == 0){
-    cout << "[ProblemGenerator]: Dump " << dump_string << " is the total computed at t=0." << endl;}
+  // // write the (p_nu=1) steady line profile averaged over frequency
+  // dump_string = default_filename("Total Volume");
+  // if (write_TotV_dump(dump_string, this->pmy_mesh, 7) == 0){
+  //   cout << "[ProblemGenerator]: Dump " << dump_string << " is the total computed at t=0." << endl;}
   
-  // write the (p_nu=1) steady line profile averaged over frequency
-  dump_string = default_filename("Cell Count");
-  if (write_TotV_dump(dump_string, this->pmy_mesh, 8) == 0){
-    cout << "[ProblemGenerator]: Dump " << dump_string << " is the total computed at t=0." << endl;}
+  // // write the (p_nu=1) steady line profile averaged over frequency
+  // dump_string = default_filename("Cell Count");
+  // if (write_TotV_dump(dump_string, this->pmy_mesh, 8) == 0){
+  //   cout << "[ProblemGenerator]: Dump " << dump_string << " is the total computed at t=0." << endl;}
+
   
+  // // Write pnu_local_avg
+  // std::string dump_string_vlos = default_filename("vlos_ijk");
+  // if (write_Pnu_dump(dump_string_vlos, this, 0, ie, je, ke, is, js, ks) == 0)
+  //   std::cout << "Done writing pnu_local_avg to " << dump_string_vlos << "." << std::endl;
+
+  // // Write pnu_nonlocal_avg
+  // std::string dump_string_dv = default_filename("dV");
+  // if (write_Pnu_dump(dump_string_dv, this, 1, ie, je, ke, is, js, ks) == 0)
+  //   std::cout << "Done writing pnu_nonlocal_avg to " << dump_string_dv << "." << std::endl;
+
+  // // Write doppler shift non relativistic
+  // std::string dump_string_nuD = default_filename("nuD");
+  // if (write_Pnu_dump(dump_string_nuD, this, 2, ie, je, ke, is, js, ks) == 0)
+  //   std::cout << "Done writing doppler shift non relativistic to " << dump_string_nuD << "." << std::endl;
+
+  // // Write doppler shift relativistic
+  // std::string dump_string_nuD1 = default_filename("nuD1");
+  // if (write_Pnu_dump(dump_string_nuD1, this, 3, ie, je, ke, is, js, ks) == 0)
+  //   std::cout << "Done writing doppler shift relativistic to " << dump_string_nuD1 << "." << std::endl;
+
+
+  //   // Write comoving frequency nonrelativistic
+  //   std::string dump_string_nucmv = default_filename("nucmv_nonrel");
+  //   if (write_nu_cmv_dump(dump_string_nucmv, this, 7, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_cmv to " << dump_string_nucmv << "." << std::endl;
+
+  //   // Write comoving frequency relativistic
+  //   std::string dump_string_nucmv1 = default_filename("nucmv1_rel");
+  //   if (write_nu_cmv_dump(dump_string_nucmv1, this, 8, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_cmv1 to " << dump_string_nucmv1 << "." << std::endl;
+    
+  //   // Write comoving frequency nonrelativistic
+  //   std::string dump_string_nuD_e = default_filename("nuD_nonrel");
+  //   if (write_nu_cmv_dump(dump_string_nuD_e, this, 9, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D to " << dump_string_nuD_e << "." << std::endl;
+
+  //   // Write comoving frequency relativistic
+  //   std::string dump_string_nuD1_e = default_filename("nuD1_rel");
+  //   if (write_nu_cmv_dump(dump_string_nuD1_e, this, 10, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D1 to " << dump_string_nuD1_e << "." << std::endl;
+
+
+  //     // pmb->ruser_meshblock_data[11](k,j,i,idx,inu) = nu;
+  //     // pmb->ruser_meshblock_data[12](k,j,i,idx,inu) = v_los;
+  //     // pmb->ruser_meshblock_data[13](k,j,i,idx,inu) = v_;
+  //     // pmb->ruser_meshblock_data[14](k,j,i,idx,inu) = arg;
+  //     // pmb->ruser_meshblock_data[15](k,j,i,idx,inu) = arg1;
+  
+
+  //   // Write comoving frequency relativistic
+  //   std::string dump_string_nu_e = default_filename("nu");
+  //   if (write_nu_cmv_dump(dump_string_nu_e, this, 11, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D1 to " << dump_string_nu_e << "." << std::endl;
+
+  //   // Write comoving frequency relativistic
+  //   std::string dump_string_vlos_e = default_filename("v_los");
+  //   if (write_nu_cmv_dump(dump_string_vlos_e, this, 12, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D1 to " << dump_string_vlos_e << "." << std::endl;
+
+  //         // Write comoving frequency relativistic
+  //   std::string dump_string_v_e = default_filename("v_");
+  //   if (write_nu_cmv_dump(dump_string_v_e, this, 13, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D1 to " << dump_string_v_e << "." << std::endl;
+
+  //   // Write comoving frequency relativistic
+  //   std::string dump_string_arg_e = default_filename("arg_nonrel");
+  //   if (write_nu_cmv_dump(dump_string_arg_e, this, 14, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D1 to " << dump_string_arg_e << "." << std::endl;
+
+  //   // Write comoving frequency relativistic
+  //   std::string dump_string_arg1_e = default_filename("arg1_rel");
+  //   if (write_nu_cmv_dump(dump_string_arg1_e, this, 15, ie, je, ke, is, js, ks, Nbins, Nnu_per_bin) == 0)
+  //     std::cout << "Done writing nu_D1 to " << dump_string_arg1_e << "." << std::endl;
+
 
  // Added to output the escape probabliity Jan 9 2025 JAK
 
@@ -575,6 +736,14 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
   Real v_t = phydro->u(IM2,k,j,i)/phydro->u(IDN,k,j,i);
   Real v_p = phydro->u(IM3,k,j,i)/phydro->u(IDN,k,j,i);
   Real v_los = v_r*proj.n_r + v_t*proj.n_t + v_p*proj.n_p;
+  Real v_ = sqrt(v_r*v_r + v_t*v_t + v_p*v_p);
+
+
+  // Doppler shift of the line center at the point i,j,k in the flow. 
+  Real nuD = nu0*calc_Doppler_Shift(v_,v_los,SR);
+
+  // Unitless frequency to look up bin
+  Real f = nuD/nu0 - 1;
 
   // Running Tally of Tau in the wing, if the wing tau is >10 then the entire band is thick and the escape probability -> 0 (skip remaining line of sight)
 
@@ -594,7 +763,7 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
 
   // identify velocity and time-delay bin this zone contributes to
   size_t i_y;
-  gsl_histogram_find(L0bins, v_los, &i_y);
+  gsl_histogram_find(L0bins, f, &i_y);
 
   // figure out ranges of frequency-loops
   Real vrange_min = y_min;
@@ -649,15 +818,17 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
   Real n_lm1 = n_l;
   Real T_lm1 = T_cgs;
   // Real kappa_lm1 = calc_opacity(xi_l,T_l);
-  Real v_lm1 = v_l;
-  //Real LF = 1/sqrt(1 -(v_r*v_r + v_t*v_t + v_p*v_p));
-  //Real nuD_lm1 = nu0/(LF*(1.-v_los));  // lab frame n, use equation 89.5
-  Real nuD_lm1 = nu0*(1.+v_los);
 
 
 
-  // if (k==ks && j==js)
-  //   cout << "\nr = " << r << endl;
+
+
+
+  // Doppler shift at a point along the line of sight
+  Real v_los_lm1 = v_los;
+  Real v_lm1 = v_;
+  Real nuD_lm1 = nu0*calc_Doppler_Shift(v_lm1,v_los_lm1,SR);
+
   int il = 0;
 
   while (r_l < r_max) {
@@ -683,8 +854,10 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
     v_l = v_x*sin_i + v_z*cos_i;
 
     // Doppler shifted line center freq
-    //Real nuD_l = nu0/(LF*(1.-v_los));  // Lab frame n , we use equation 89.5
-    Real nuD_l = nu0*(1.+v_l);
+    Real v_1 = sqrt(v_r*v_r + v_t*v_t + v_p*v_p);
+    Real nuD_l = nu0*calc_Doppler_Shift(v_1,v_l,SR);
+
+    
 
     // calculate the Sobolev length (for comparison purposes)
     Real Q,l_sob;
@@ -725,8 +898,8 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
         // for all frequencies in this bin
         for (int inu=0; inu < Nnu_per_bin; inu++) {
           Real nu = nu1 + inu*dnu;
-          Real alpha_lm1 = calc_alpha(n_lm1,T_lm1,nuD_lm1,nu);
-          Real alpha_l = calc_alpha(n_l,T_l,nuD_l,nu);
+          Real alpha_lm1 = calc_alpha(n_lm1,T_lm1,nuD_lm1,nu,SR,argb);
+          Real alpha_l = calc_alpha(n_l,T_l,nuD_l,nu,SR,argb);
           Real delta_tau = (length_unit*dl)*0.5*(alpha_lm1 + alpha_l); // JAK added length unit to match alpha units correctly // Added relativisitic factor (nu/nu0) see notes
           
 
@@ -750,27 +923,27 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
 
           pmb->pmy_mesh->ruser_mesh_data[idx_0or1](idx,inu) *= p_nu;
 
-          if (idx == yidx_L && inu == 0){ 
-            tauW += delta_tau;} // Collect tau in the wing 
+          // if (idx == yidx_L && inu == 0){ 
+          //   tauW += delta_tau;} // Collect tau in the wing 
 
-          if (tauW > 5){ // if tau in the wing = 5 then escape probability is negligable for the whole frequency range. (terminate the LOS calculation from this point)
+          // if (tauW > 5){ // if tau in the wing = 5 then escape probability is negligable for the whole frequency range. (terminate the LOS calculation from this point)
             
-            // loop over central bin as well as the neighboring bins
-            for (int yidx=yidx_L; yidx<=yidx_R; yidx++) {
-              if (i_edge == 0){
-                idx = yidx;}
-              else { // for edge cases, yidx is 0 or 1
-                idx = i_edge - yidx;}
+          //   // loop over central bin as well as the neighboring bins
+          //   for (int yidx=yidx_L; yidx<=yidx_R; yidx++) {
+          //     if (i_edge == 0){
+          //       idx = yidx;}
+          //     else { // for edge cases, yidx is 0 or 1
+          //       idx = i_edge - yidx;}
 
-              for (int inu=0; inu < Nnu_per_bin; inu++) {
-                  pmb->pmy_mesh->ruser_mesh_data[0](idx,inu) = 0; // Set local escape probability to zero
-                  pmb->pmy_mesh->ruser_mesh_data[1](idx,inu) = 0; // Set local escape probability to zero
-                  r_l = r_max+r_max; // and end while loop
-                  }}
+          //     for (int inu=0; inu < Nnu_per_bin; inu++) {
+          //         pmb->pmy_mesh->ruser_mesh_data[0](idx,inu) = 0; // Set local escape probability to zero
+          //         pmb->pmy_mesh->ruser_mesh_data[1](idx,inu) = 0; // Set local escape probability to zero
+          //         r_l = r_max+r_max; // and end while loop
+          //         }}
                   
-            tauW = 0;
-            cout <<  "Terminate  i = " << i << ", j = " << j << ", k = " << k << endl;
-          }
+          //   tauW = 0;
+          //   cout <<  "Terminate  i = " << i << ", j = " << j << ", k = " << k << endl;
+          // }
             
           
         }
@@ -794,10 +967,7 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
 
   pmb->pmy_mesh->ruser_mesh_data[7](1) += dV;
   pmb->pmy_mesh->ruser_mesh_data[8](1) += 1;
-  //pmb->pmy_mesh->ruser_mesh_data[10](1) += calc_jnu(n_cgs,T_cgs,nuD,nuD)*;
   
-  Real nuD = nu0*(1.+v_los);
-  // Real nuD = nu0/(LF*(1.-v_los));   /// Going from lab frame to comoving frame, see page 412 eq 89.5 Rad Hydro Mihalas , v_los = labframe n dot v
   Real nu_sum = 0.;
   Real jnu_avg = 0.;
   Real jeff_avg = 0.;
@@ -811,10 +981,10 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
       idx = i_edge - yidx;
     Real nu_min = nu0*(1.+L0bins->range[idx]);
     Real nu1 = nu_min + 0.5*dnu;
-    Real j_nu,j_nuD;
+    Real j_nu,j_nuD, j_nu1, nu_cmv, nu_cmv1, arg, arg1;
    
     if (use_nuD) // 4testing: evaluate all frequencies at line-center only
-      j_nuD = calc_jnu(n_cgs,T_cgs,nuD,nuD);  
+      j_nuD = calc_jnu(n_cgs,T_cgs,nuD,nuD,SR);  
 
     for (int inu=0; inu < Nnu_per_bin; inu++) {
       Real nu = nu1 + inu*dnu;
@@ -825,8 +995,8 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
         pmb->pmy_mesh->iuser_mesh_data[0](idx) += 1;
       }
       else 
-        j_nu = calc_jnu(n_cgs,T_cgs,nuD,nu); // Added Relativistic scaling factor
-
+        j_nu = calc_jnu(n_cgs,T_cgs,nuD,nu,SR); 
+       
       // retrieve escape probability calculated in above while-loop
       Real pnu_local = pmb->pmy_mesh->ruser_mesh_data[0](idx,inu);
       Real pnu_nonlocal = pmb->pmy_mesh->ruser_mesh_data[1](idx,inu);
@@ -837,14 +1007,16 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
       pmb->pmy_mesh->ruser_mesh_data[3](idx,inu) += j_nu*dV;
       pmb->pmy_mesh->ruser_mesh_data[6](idx,inu) += dV;
       pmb->pmy_mesh->ruser_mesh_data[9](idx,inu) += 1;
-      
-
-      //std::cout << "idx = " << idx << std::endl;
-      //std::cout << "inu = " << inu << std::endl;
-
-      // pmb->pmy_mesh->ruser_mesh_data[7](1) += dV;
-      // pmb->pmy_mesh->ruser_mesh_data[8](1) += 1;
-
+      // pmb->ruser_meshblock_data[7](k,j,i,idx,inu) = nu_cmv;
+      // pmb->ruser_meshblock_data[8](k,j,i,idx,inu) = nu_cmv1;
+      // pmb->ruser_meshblock_data[9](k,j,i,idx,inu) = nuD;
+      // pmb->ruser_meshblock_data[10](k,j,i,idx,inu) = nuD1;
+      // pmb->ruser_meshblock_data[11](k,j,i,idx,inu) = nu;
+      // pmb->ruser_meshblock_data[12](k,j,i,idx,inu) = v_los;
+      // pmb->ruser_meshblock_data[13](k,j,i,idx,inu) = v_;
+      // pmb->ruser_meshblock_data[14](k,j,i,idx,inu) = arg;
+      // pmb->ruser_meshblock_data[15](k,j,i,idx,inu) = arg1;
+  
       // compute freq-integrated p_nus and j_nus 
       nu_sum += nu;
       jnu_avg += nu*j_nu;
@@ -860,13 +1032,20 @@ void calc_LP_using_binning(MeshBlock* pmb, int k, int j, int i, AthenaArray<Real
   pnu_nonlocal_avg /= nu_sum;
   jnu_avg /= nu_sum;
   jeff_avg /= nu_sum;
-  pmb->ruser_meshblock_data[0](k,j,i) = pnu_local_avg;
-  pmb->ruser_meshblock_data[1](k,j,i) = pnu_nonlocal_avg;
+  pmb->ruser_meshblock_data[0](k,j,i) = v_los;
+  pmb->ruser_meshblock_data[1](k,j,i) = dV;
   pmb->ruser_meshblock_data[4](k,j,i) = ctr;
   pmb->ruser_meshblock_data[5](k,j,i) = log(pnu_local_avg*pnu_nonlocal_avg);
   pmb->ruser_meshblock_data[2](k,j,i) = jnu_avg;
   pmb->ruser_meshblock_data[3](k,j,i) = jeff_avg;
 
+
+  // pmb->ruser_meshblock_data[0](k,j,i) = pnu_local_avg;
+  // pmb->ruser_meshblock_data[1](k,j,i) = pnu_nonlocal_avg;
+  // pmb->ruser_meshblock_data[4](k,j,i) = ctr;
+  // pmb->ruser_meshblock_data[5](k,j,i) = log(pnu_local_avg*pnu_nonlocal_avg);
+  // pmb->ruser_meshblock_data[2](k,j,i) = jnu_avg;
+  // pmb->ruser_meshblock_data[3](k,j,i) = jeff_avg;
 }
 
 
@@ -1021,6 +1200,42 @@ int write_Pnu_dump(string fname, MeshBlock *pmb, int n, int ie, int je, int ke, 
   return 0;
 }
 
+// ruser_meshblock_data[7](k,j,i,idx,inu)
+
+int write_nu_cmv_dump(string fname, MeshBlock *pmb, int n, int ie, int je, int ke, int is, int js, int ks, int Nbins, int Nnu_per_bin)
+{
+  int status;
+
+  FILE *stream;
+  std::stringstream msg;
+  if ((stream = fopen(fname.c_str(),"w+")) == nullptr) {
+      msg << "### FATAL ERROR in function [write_Pnu_dump]"
+          << std::endl << "Error output file could not be opened" <<std::endl;
+      ATHENA_ERROR(msg);
+    }
+  // status = fprintf (stream, "%e", pm->ruser_mesh_data[1](0,0));
+  
+  for (int k = ks; k <= ke; k++)
+    for (int j = js; j <= je; j++)
+      for (int i =is; i <= ie; i++)
+        for (int l =0; l <= Nbins; l++)
+          for (int m =0; m <= Nnu_per_bin; m++)
+            {
+              status = fprintf (stream, "%e", pmb->ruser_meshblock_data[n](k,j,i,l,m));
+              status = putc ('\n', stream);
+              // if (l == Nbins)
+              //   if (m == Nnu_per_bin)
+              //   {
+              //     cout <<  "Terminate  i = " << i << ", j = " << j << ", k = " << k << ", l =" << l << ", m =" << m << ", nu_cmv = " << pmb->ruser_meshblock_data[n](k,j,i,l,m) << endl;
+              //   }
+            }
+  
+  // pmb->ruser_meshblock_data[0](k,j,i) = pnu_local_avg;
+  // pmb->ruser_meshblock_data[1](k,j,i) = pnu_nonlocal_avg;
+  fclose(stream);
+
+  return 0;
+}
 
 int write_TotV_dump(string fname, Mesh *pm, int n)
 {
